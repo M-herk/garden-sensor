@@ -1,0 +1,58 @@
+services:
+  influxdb:
+    image: influxdb:1.8
+    container_name: influxdb
+    restart: unless-stopped
+    ports:
+      - "8086:8086"
+    environment:
+      INFLUXDB_DB: sensors
+      INFLUXDB_USER: telegraf
+      INFLUXDB_USER_PASSWORD: telegraf
+      INFLUXDB_ADMIN_USER: admin
+      INFLUXDB_ADMIN_PASSWORD: admin
+    volumes:
+      - influxdb-data:/var/lib/influxdb
+    networks:
+      - tig
+      - mqtt
+
+  telegraf:
+    image: telegraf:latest
+    container_name: telegraf
+    restart: unless-stopped
+    depends_on:
+      - influxdb
+    volumes:
+      - ./telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+    networks:
+      - tig
+      - mqtt
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - influxdb
+    networks:
+      - tig
+
+volumes:
+  influxdb-data:
+  grafana-data:
+
+networks:
+  tig:
+    driver: bridge
+  mqtt:
+    external: true
+    name: mosquitto_default
+
