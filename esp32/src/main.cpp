@@ -9,85 +9,153 @@
 #include "config.h"
 
 // --- NTP ---
-// Used to get a real timestamp for each reading.
-// Adjust timezone offset (seconds) if you want local time,
-// or leave at 0 to store UTC (recommended for InfluxDB/Grafana).
-#define NTP_SERVER    "pool.ntp.org"
+#define NTP_SERVER     "pool.ntp.org"
 #define NTP_UTC_OFFSET 0
 #define NTP_DST_OFFSET 0
 
-BH1750 lightMeter;
+// --- RTC memory (survives deep sleep) ---
+// Stores WiFi channel + BSSID for fast reconnect, and boot count.
+RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR uint8_t rtcBssid[6];
+RTC_DATA_ATTR uint8_t rtcChannel;
+RTC_DATA_ATTR bool    rtcWifiValid = false;
+
+BH1750     lightMeter;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
-unsigned long lastSampleTime = 0;
-
 // ----------------------------------------------------------------
-// WiFi
+// WiFi - fast reconnect on subsequent boots using RTC-cached info
 // ----------------------------------------------------------------
-void connectWifi() {
+bool connectWifi() {
     Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
+    if (rtcWifiValid) {
+        // Use cached channel + BSSID to skip full scan
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD, rtcChannel, rtcBssid, true);
+    } else {
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+
+    unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
+        if (millis() - start > WIFI_TIMEOUT_MS) {
+            Serial.println("\nWiFi timeout.");
+            // Invalidate cached info so next boot does a full scan
+            rtcWifiValid = false;
+            return false;
+        }
+        delay(100);
         Serial.print(".");
     }
 
+    // Cache connection info for next wake
+    rtcChannel  = WiFi.channel();
+    memcpy(rtcBssid, WiFi.BSSID(), 6);
+    rtcWifiValid = true;
+
     Serial.printf("\nWiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
 }
 
 // ----------------------------------------------------------------
-// MQTT
+// NTP sync
 // ----------------------------------------------------------------
-void connectMqtt() {
-    while (!mqttClient.connected()) {
-        Serial.printf("Connecting to MQTT broker: %s:%d\n", MQTT_BROKER, MQTT_PORT);
-
-        bool connected = (strlen(MQTT_USER) > 0)
-            ? mqttClient.connect(DEVICE_ID, MQTT_USER, MQTT_PASSWORD)
-            : mqttClient.connect(DEVICE_ID);
-
-        if (connected) {
-            Serial.println("MQTT connected.");
-        } else {
-            Serial.printf("MQTT connect failed, rc=%d. Retrying in 5s\n", mqttClient.state());
-            delay(5000);
-        }
-    }
-}
-
-// ----------------------------------------------------------------
-// NTP sync - call once after WiFi connects
-// ----------------------------------------------------------------
-void syncTime() {
+bool syncTime() {
     configTime(NTP_UTC_OFFSET, NTP_DST_OFFSET, NTP_SERVER);
     Serial.print("Waiting for NTP sync");
     time_t now = 0;
-    int retries = 0;
-    while (now < 1000000000L && retries < 20) {
-        delay(500);
+    unsigned long start = millis();
+    while (now < 1000000000L) {
+        if (millis() - start > NTP_TIMEOUT_MS) {
+            Serial.println("\nNTP sync timeout.");
+            return false;
+        }
+        delay(200);
         Serial.print(".");
         time(&now);
-        retries++;
     }
-    Serial.println(now > 0 ? "\nNTP synced." : "\nNTP sync failed - timestamps will be 0.");
+    Serial.println("\nNTP synced.");
+    return true;
 }
 
 // ----------------------------------------------------------------
-// Publish a reading
+// MQTT connect
 // ----------------------------------------------------------------
-void publishReading(float lux) {
+bool connectMqtt() {
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    Serial.printf("Connecting to MQTT: %s:%d\n", MQTT_BROKER, MQTT_PORT);
+
+    unsigned long start = millis();
+    while (!mqttClient.connected()) {
+        if (millis() - start > MQTT_TIMEOUT_MS) {
+            Serial.println("MQTT timeout.");
+            return false;
+        }
+
+        bool ok = (strlen(MQTT_USER) > 0)
+            ? mqttClient.connect(DEVICE_ID, MQTT_USER, MQTT_PASSWORD)
+            : mqttClient.connect(DEVICE_ID);
+
+        if (!ok) {
+            Serial.printf("MQTT failed rc=%d, retrying...\n", mqttClient.state());
+            delay(500);
+        }
+    }
+    Serial.println("MQTT connected.");
+    return true;
+}
+
+// ----------------------------------------------------------------
+// Sample lux for SAMPLE_WINDOW_MS, return average
+// ----------------------------------------------------------------
+float sampleAverageLux() {
+    // ONE_TIME_HIGH_RES_MODE: sensor powers down after each read (power efficient)
+    // Each measurement takes ~120ms
+
+    float   sum     = 0;
+    int     count   = 0;
+    unsigned long windowStart = millis();
+
+    Serial.printf("Sampling lux for %d ms...\n", SAMPLE_WINDOW_MS);
+
+    while (millis() - windowStart < SAMPLE_WINDOW_MS) {
+        lightMeter.configure(BH1750::ONE_TIME_HIGH_RES_MODE);
+        delay(150); // wait for measurement to complete (~120ms + margin)
+
+        float lux = lightMeter.readLightLevel();
+        if (lux >= 0) {
+            sum += lux;
+            count++;
+            Serial.printf("  Sample %d: %.2f lux\n", count, lux);
+        } else {
+            Serial.println("  BH1750 read error, skipping sample.");
+        }
+    }
+
+    if (count == 0) {
+        Serial.println("No valid samples collected.");
+        return -1.0f;
+    }
+
+    float avg = sum / count;
+    Serial.printf("Average lux over %d samples: %.2f\n", count, avg);
+    return avg;
+}
+
+// ----------------------------------------------------------------
+// Publish reading
+// ----------------------------------------------------------------
+bool publishReading(float lux) {
     time_t now;
     time(&now);
 
-    // Build JSON payload
-    // Example: {"device_id":"garden_sensor_01","lux":4521.5,"timestamp":1712000000}
     JsonDocument doc;
     doc["device_id"]  = DEVICE_ID;
     doc["lux"]        = lux;
     doc["timestamp"]  = (long)now;
+    doc["boot_count"] = bootCount;
 
     char payload[128];
     serializeJson(doc, payload, sizeof(payload));
@@ -96,57 +164,80 @@ void publishReading(float lux) {
 
     if (!mqttClient.publish(MQTT_TOPIC, payload)) {
         Serial.println("Publish failed.");
+        return false;
     }
+    return true;
 }
 
 // ----------------------------------------------------------------
-// Setup
+// Go to deep sleep
+// ----------------------------------------------------------------
+void goToSleep() {
+    Serial.printf("Going to sleep for %d seconds.\n", SLEEP_DURATION_SEC);
+    Serial.flush();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_DURATION_SEC * 1000000ULL);
+    esp_deep_sleep_start();
+}
+
+// ----------------------------------------------------------------
+// Setup - runs once per wake cycle, then sleeps
 // ----------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
-    delay(500);
-    Serial.println("\n--- Garden Light Sensor ---");
+    delay(200);
+
+    bootCount++;
+    Serial.printf("\n--- Garden Light Sensor (boot #%d) ---\n", bootCount);
     Serial.printf("Device ID: %s\n", DEVICE_ID);
 
     // Init I2C and BH1750
     Wire.begin();
-    if (!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
-        Serial.println("ERROR: BH1750 not found. Check wiring.");
-        while (true) { delay(1000); }
+    if (!lightMeter.begin(BH1750::ONE_TIME_HIGH_RES_MODE)) {
+        Serial.println("ERROR: BH1750 not found. Check wiring. Going to sleep.");
+        goToSleep();
     }
     Serial.println("BH1750 initialised.");
 
-    connectWifi();
-    syncTime();
+    // WiFi
+    if (!connectWifi()) {
+        Serial.println("WiFi failed. Going to sleep.");
+        goToSleep();
+    }
 
-    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    // NTP
+    if (!syncTime()) {
+        Serial.println("NTP failed. Going to sleep.");
+        goToSleep();
+    }
 
-    // Take an immediate reading on boot rather than waiting for first interval
-    lastSampleTime = millis() - SAMPLE_INTERVAL_MS;
+    // Sample lux
+    float avgLux = sampleAverageLux();
+    if (avgLux < 0) {
+        Serial.println("Sampling failed. Going to sleep.");
+        goToSleep();
+    }
+
+    // MQTT
+    if (!connectMqtt()) {
+        Serial.println("MQTT failed. Going to sleep.");
+        goToSleep();
+    }
+
+    // Publish
+    publishReading(avgLux);
+
+    // Allow MQTT to flush
+    mqttClient.loop();
+    delay(200);
+
+    goToSleep();
 }
 
 // ----------------------------------------------------------------
-// Loop
+// Loop - unused in deep sleep architecture
 // ----------------------------------------------------------------
 void loop() {
-    // Maintain MQTT connection
-    if (!mqttClient.connected()) {
-        connectMqtt();
-    }
-    mqttClient.loop();
-
-    // Sample on interval
-    unsigned long now = millis();
-    if (now - lastSampleTime >= SAMPLE_INTERVAL_MS) {
-        lastSampleTime = now;
-
-        float lux = lightMeter.readLightLevel();
-
-        if (lux < 0) {
-            Serial.println("BH1750 read error.");
-        } else {
-            Serial.printf("Lux: %.1f\n", lux);
-            publishReading(lux);
-        }
-    }
+    // intentionally empty
 }

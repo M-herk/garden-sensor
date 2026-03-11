@@ -18,8 +18,18 @@
 #define MQTT_USER     ""
 #define MQTT_PASSWORD ""
 
-// --- Sampling ---
-// How often to take a reading and publish (milliseconds)
+// --- Sleep / Sampling ---
+// How long to sleep between wake cycles (seconds)
+#define SLEEP_DURATION_SEC  10        // dev: 10 seconds
+//#define SLEEP_DURATION_SEC  600     // production: 10 minutes
 
-//#define SAMPLE_INTERVAL_MS 60000   // 1 minute
-#define SAMPLE_INTERVAL_MS 5000   // 5 seconds
+// How long to collect lux samples each wake cycle (milliseconds)
+// Each BH1750 ONE_TIME_HIGH_RES_MODE reading takes ~150ms
+// 10000ms window = ~66 samples averaged together
+#define SAMPLE_WINDOW_MS    10000     // 10 seconds
+
+// --- Timeouts ---
+#define WIFI_TIMEOUT_MS     10000     // 10 seconds
+#define NTP_TIMEOUT_MS       5000     // 5 seconds
+#define MQTT_TIMEOUT_MS      5000     // 5 seconds
+
